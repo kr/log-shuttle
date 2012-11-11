@@ -13,7 +13,6 @@ import (
 	"net/url"
 	"os"
 	"strconv"
-	"sync/atomic"
 	"time"
 )
 
@@ -74,7 +73,7 @@ func handle(lines <-chan string, batches chan<- []string) {
 	}
 }
 
-func read(r io.ReadCloser, lines chan<- string, drops *uint64, reads *uint64) {
+func read(r io.ReadCloser, lines chan<- string, drops, reads chan<- uint64) {
 	rdr := bufio.NewReader(r)
 	for {
 		line, err := rdr.ReadString('\n')
@@ -83,9 +82,9 @@ func read(r io.ReadCloser, lines chan<- string, drops *uint64, reads *uint64) {
 		if err == nil {
 			select {
 			case lines <- line:
-				atomic.AddUint64(reads, 1)
+				reads <- 1
 			default:
-				atomic.AddUint64(drops, 1)
+				drops <- 1
 			}
 		} else {
 			r.Close()
@@ -94,14 +93,25 @@ func read(r io.ReadCloser, lines chan<- string, drops *uint64, reads *uint64) {
 	}
 }
 
-func report(lines chan string, batches chan []string, drops *uint64, reads *uint64) {
+func report(lines chan string, batches chan []string, drops, reads <-chan uint64) {
 	for _ = range time.Tick(time.Second) {
-		d := atomic.LoadUint64(drops)
-		r := atomic.LoadUint64(reads)
-		atomic.AddUint64(drops, -d)
-		atomic.AddUint64(reads, -r)
-		fmt.Fprintf(os.Stdout, "reads=%d drops=%d lines=%d batches=%d\n", r, d, len(lines), len(batches))
+		fmt.Fprintf(os.Stdout, "reads=%d drops=%d lines=%d batches=%d\n", <-reads, <-drops, len(lines), len(batches))
 	}
+}
+
+func counter(n uint64) (chan<- uint64, <-chan uint64) {
+	add, poll := make(chan uint64), make(chan uint64)
+	go func() {
+		for {
+			select {
+			case k := <-add:
+				n += k
+			case poll <- n:
+				n = 0
+			}
+		}
+	}()
+	return add, poll
 }
 
 func main() {
@@ -111,18 +121,18 @@ func main() {
 	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	http.DefaultTransport = tr
 
-	var drops uint64 = 0
-	var reads uint64 = 0
+	dropadd, droppoll := counter(0)
+	readadd, readpoll := counter(0)
 
 	batches := make(chan []string)
 	lines := make(chan string, buffSize)
 
-	go report(lines, batches, &drops, &reads)
+	go report(lines, batches, droppoll, readpoll)
 	go handle(lines, batches)
 	go outlet(batches)
 
 	if len(*socket) == 0 {
-		read(os.Stdin, lines, &drops, &reads)
+		read(os.Stdin, lines, dropadd, readadd)
 	} else {
 		l, err := net.Listen("unix", *socket)
 		if err != nil {
@@ -133,7 +143,7 @@ func main() {
 			if err != nil {
 				fmt.Printf("Accept error. err=%v", err)
 			}
-			go read(conn, lines, &drops, &reads)
+			go read(conn, lines, dropadd, readadd)
 		}
 	}
 }
